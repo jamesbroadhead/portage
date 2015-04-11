@@ -352,7 +352,7 @@ class Scheduler(PollScheduler):
 		Use this to free memory at the beginning of _calc_resume_list().
 		After _calc_resume_list(), the _init_graph() method
 		must to be called in order to re-generate the structures that
-		this method destroys. 
+		this method destroys.
 		"""
 		self._blocker_db = None
 		self._set_graph_config(None)
@@ -777,15 +777,37 @@ class Scheduler(PollScheduler):
 		output directly to stdout (regardless of options like --quiet or
 		--jobs).
 		"""
+		return self._pkg_pretend(self._mergelist)
 
-		failures = 0
+	def _pkg_pretend(self, mergelist):
+		""" Call pkg_pretend for the supplied mergelist.
 
+		if --keep-going has been passed, mutate and reduce the mergelist
+		    on failures until success (or the mergelist is exhausted)
+		"""
+		keep_going = "--keep-going" in self.myopts
+		failed_packages = self._pkg_pretend_over_mergelist(mergelist)
+
+		if not failed_packages:
+			return os.EXEC_OK
+
+		elif keep_going:
+			new_mergelist = self._recalculate_mergelist(self._mergelist, failed_packages)
+			if not new_mergelist:
+				return 1
+			return _pkg_pretend(new_mergelist)
+		else:
+			return 1
+
+	def _pkg_pretend_over_mergelist(self, mergelist):
+		""" iterate over self._mergelist doing pkg_pretend """
 		# Use a local EventLoop instance here, since we don't
 		# want tasks here to trigger the usual Scheduler callbacks
 		# that handle job scheduling and status display.
 		sched_iface = SchedulerInterface(EventLoop(main=False))
+		failed_packages = []
 
-		for x in self._mergelist:
+		for x in mergelist:
 			if not isinstance(x, Package):
 				continue
 
@@ -809,7 +831,8 @@ class Scheduler(PollScheduler):
 			# have to validate it for each package
 			rval = _check_temp_dir(settings)
 			if rval != os.EX_OK:
-				return rval
+				failed_packages.append(x)
+				continue
 
 			build_dir_path = os.path.join(
 				os.path.realpath(settings["PORTAGE_TMPDIR"]),
@@ -858,7 +881,7 @@ class Scheduler(PollScheduler):
 							scheduler=sched_iface)
 						fetcher.start()
 						if fetcher.wait() != os.EX_OK:
-							failures += 1
+							failed_packages.append(x)
 							continue
 						fetched = fetcher.pkg_path
 
@@ -871,7 +894,7 @@ class Scheduler(PollScheduler):
 					current_task = verifier
 					verifier.start()
 					if verifier.wait() != os.EX_OK:
-						failures += 1
+						failed_packages.append(x)
 						continue
 
 					if fetched:
@@ -915,7 +938,7 @@ class Scheduler(PollScheduler):
 				pretend_phase.start()
 				ret = pretend_phase.wait()
 				if ret != os.EX_OK:
-					failures += 1
+					failed_packages.append(x)
 				portage.elog.elog_process(x.cpv, settings)
 			finally:
 
@@ -932,9 +955,7 @@ class Scheduler(PollScheduler):
 
 				build_dir.unlock()
 
-		if failures:
-			return 1
-		return os.EX_OK
+		return failed_packages
 
 	def merge(self):
 		if "--resume" in self.myopts:
@@ -1054,27 +1075,8 @@ class Scheduler(PollScheduler):
 			if not failed_pkgs:
 				break
 
-			for failed_pkg in failed_pkgs:
-				mergelist.remove(list(failed_pkg.pkg))
-
-			self._failed_pkgs_all.extend(failed_pkgs)
-			del failed_pkgs[:]
-
-			if not mergelist:
+			if not self._recalculate_mergelist(mergelist, failed_pkgs):
 				break
-
-			if not self._calc_resume_list():
-				break
-
-			clear_caches(self.trees)
-			if not self._mergelist:
-				break
-
-			self._save_resume_list()
-			self._pkg_count.curval = 0
-			self._pkg_count.maxval = len([x for x in self._mergelist \
-				if isinstance(x, Package) and x.operation == "merge"])
-			self._status_display.maxval = self._pkg_count.maxval
 
 		self._logger.log(" *** Finished. Cleaning up...")
 
@@ -1179,6 +1181,34 @@ class Scheduler(PollScheduler):
 		if self._failed_pkgs_all:
 			return 1
 		return os.EX_OK
+
+	def _recalculate_mergelist(self, mergelist, failed_pkgs):
+		""" Recalculates the mergelist following some failures
+
+		@return list:   the new mergelist, or None
+		"""
+		for failed_pkg in failed_pkgs:
+			mergelist.remove(list(failed_pkg.pkg))
+
+		self._failed_pkgs_all.extend(failed_pkgs)
+		del failed_pkgs[:]
+
+		if not mergelist:
+			return None
+
+		if not self._calc_resume_list():
+			return None
+
+		clear_caches(self.trees)
+		if not self._mergelist:
+			return None
+
+		self._save_resume_list()
+		self._pkg_count.curval = 0
+		self._pkg_count.maxval = len([x for x in self._mergelist \
+			if isinstance(x, Package) and x.operation == "merge"])
+		self._status_display.maxval = self._pkg_count.maxval
+		return self._mergelist
 
 	def _elog_listener(self, mysettings, key, logentries, fulltext):
 		errors = portage.elog.filter_loglevels(logentries, ["ERROR"])
